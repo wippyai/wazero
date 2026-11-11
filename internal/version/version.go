@@ -14,7 +14,9 @@ var version string
 // GetWazeroVersion returns the current version of wazero either in the go.mod or set by ldflag for wazero CLI.
 //
 // If this is not CLI, this assumes that downstream users of wazero imports wazero as "github.com/tetratelabs/wazero".
-// To be precise, the returned string matches the require statement there.
+// The returned string matches the require statement, or the replacement version
+// when the module is replaced with a versioned dependency. Compilation caches
+// must distinguish the implementation selected by the replacement.
 // For example, if the go.mod has "require github.com/tetratelabs/wazero 0.1.2-12314124-abcd",
 // then this returns "0.1.2-12314124-abcd".
 //
@@ -33,7 +35,7 @@ func init() {
 		for _, dep := range info.Deps {
 			// Note: here's the assumption that wazero is imported as github.com/tetratelabs/wazero.
 			if strings.Contains(dep.Path, "github.com/tetratelabs/wazero") {
-				version = dep.Version
+				version = moduleVersion(dep)
 			}
 		}
 
@@ -45,6 +47,13 @@ func init() {
 	if versionMissing(version) {
 		version = Default // don't return parens
 	}
+}
+
+func moduleVersion(dep *debug.Module) string {
+	if dep.Replace != nil && !versionMissing(dep.Replace.Version) {
+		return dep.Replace.Version
+	}
+	return dep.Version
 }
 
 func versionMissing(ret string) bool {
