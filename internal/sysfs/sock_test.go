@@ -169,6 +169,11 @@ func TestTcpConnFile_SetNonblock(t *testing.T) {
 	require.EqualErrno(t, 0, errno)
 	require.True(t, nblf.IsNonblock())
 
+	// Accept is fixture setup: a successful dial need not make a
+	// non-blocking accept ready immediately on every host. Verify toggling
+	// back to blocking mode before obtaining the connection.
+	require.EqualErrno(t, 0, nblf.SetNonblock(false))
+	require.False(t, nblf.IsNonblock())
 	conn, errno := lf.Accept()
 	require.EqualErrno(t, 0, errno)
 	defer conn.Close()
