@@ -170,6 +170,9 @@ func (t *thrownException) doRestore(ce *callEngine, callerFrameCount int) {
 type callEngine struct {
 	internalapi.WazeroOnlyType
 
+	// closeWatch serves ensureTermination for the sequential calls of this engine.
+	closeWatch wasm.CloseWatch
+
 	// stack contains the operands.
 	// Note that all the values are represented as uint64.
 	stack []uint64
@@ -773,8 +776,7 @@ func (ce *callEngine) call(ctx context.Context, params, results []uint64) (_ []u
 	ce.pushValues(params)
 
 	if ce.f.parent.ensureTermination {
-		done := m.CloseModuleOnCanceledOrTimeout(ctx)
-		defer done()
+		defer ce.closeWatch.Start(m, ctx).Stop()
 	}
 
 	ce.callFunction(ctx, m, ce.f)
