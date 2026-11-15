@@ -514,3 +514,18 @@ func TestModuleInstance_ensureResourcesClosed(t *testing.T) {
 		require.NotNil(t, mem.expBuffer)
 	})
 }
+
+func TestCloseWatchNestedBackgroundDoesNotStopOuter(t *testing.T) {
+	module := &ModuleInstance{ModuleName: "nested", s: newStore()}
+	var watch CloseWatch
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	outer := watch.Start(module, ctx)
+	inner := watch.Start(module, context.Background())
+	inner.Stop()
+	cancel()
+	// Run the callback deterministically instead of depending on scheduling.
+	watch.fire()
+	outer.Stop()
+	require.True(t, module.IsClosed(), "nested background call stopped the outer cancellation watch")
+}

@@ -56,12 +56,12 @@ type CloseWatch struct {
 // Start watches ctx for one call of m and returns the watch to Stop when the
 // call ends. A nested call while w is active gets a new watch.
 func (w *CloseWatch) Start(m *ModuleInstance, ctx context.Context) *CloseWatch {
-	if ctx.Done() == nil {
-		// The context can never be canceled.
-		return w
-	}
 	if w.stop != nil {
 		return (&CloseWatch{}).Start(m, ctx)
+	}
+	if ctx.Done() == nil {
+		// A nested non-cancelable call must not stop its outer call's watch.
+		return w
 	}
 	if w.fireFunc == nil {
 		w.fireFunc = w.fire
@@ -91,12 +91,13 @@ func (w *CloseWatch) Stop() {
 // the module only if that context ended too.
 func (w *CloseWatch) fire() {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.finished {
-		w.mu.Unlock()
 		return
 	}
+	// Serialize closing with Stop and the next Start. An expired callback
+	// must not close an instance after a later call has begun.
 	m, err := w.m, w.ctx.Err()
-	w.mu.Unlock()
 	// This is the same logic as CloseWithCtxErr except this calls closeWithExitCodeWithoutClosingResource
 	// so that we can defer the resource closure in FailIfClosed.
 	switch {
