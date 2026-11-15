@@ -264,8 +264,14 @@ func (m *MemoryInstance) Grow(delta uint32) (result uint32, ok bool) {
 		if m.Shared {
 			panic("shared memory cannot be grown, this is a bug in wazero")
 		}
-		m.Buffer = append(m.Buffer, make([]byte, MemoryPagesToBytesNum(delta))...)
-		m.Cap = newPages
+		// Double the capacity: append grows large slices by about 1.25x, so a
+		// guest that grows page by page reallocated and copied its memory many times.
+		capPages := max(newPages, m.Cap*2)
+		capPages = min(capPages, m.Max)
+		buffer := make([]byte, MemoryPagesToBytesNum(newPages), MemoryPagesToBytesNum(capPages))
+		copy(buffer, m.Buffer)
+		m.Buffer = buffer
+		m.Cap = capPages
 	} else { // We already have the capacity we need.
 		if m.Shared {
 			// We assume grow is called under a guest lock.

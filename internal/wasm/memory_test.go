@@ -105,10 +105,8 @@ func TestMemoryInstance_Grow_Size(t *testing.T) {
 			// So in total, the memoryGrown should be called 3 times.
 			require.Equal(t, 3, me.memoryGrown)
 
-			if tc.capEqualsMax { // Ensure the capacity isn't more than max.
+			if !tc.expAllocator && !tc.failAllocator { // Ensure the capacity isn't more than max.
 				require.Equal(t, maxBytes, uint64(cap(m.Buffer)))
-			} else { // Slice doubles, so it should have a higher capacity than max.
-				require.True(t, maxBytes < uint64(cap(m.Buffer)))
 			}
 		})
 	}
@@ -1037,4 +1035,36 @@ func (b *sliceBuffer) Reallocate(size uint64) []byte {
 		b.buf = b.buf[:size]
 	}
 	return b.buf
+}
+
+// BenchmarkMemoryInstance_GrowByPage grows a memory one page at a time to 20 MiB,
+// as a guest allocator does while it grows its heap.
+func BenchmarkMemoryInstance_GrowByPage(b *testing.B) {
+	const pages = 320
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		m := &MemoryInstance{Max: MemoryLimitPages, Buffer: make([]byte, 0), ownerModuleEngine: &mockModuleEngine{}}
+		for p := 0; p < pages; p++ {
+			if _, ok := m.Grow(1); !ok {
+				b.Fatal("grow failed")
+			}
+		}
+	}
+}
+
+func TestMemoryInstance_GrowKeepsDataAndZeroesNewPages(t *testing.T) {
+	m := &MemoryInstance{Max: 5, Buffer: make([]byte, MemoryPageSize), Cap: 1, ownerModuleEngine: &mockModuleEngine{}}
+	m.Buffer[MemoryPageSize-1] = 0xaa
+	for i := 0; i < 4; i++ {
+		_, ok := m.Grow(1)
+		require.True(t, ok)
+		require.Equal(t, byte(0xaa), m.Buffer[MemoryPageSize-1])
+		for _, b := range m.Buffer[MemoryPageSize:] {
+			require.Equal(t, byte(0), b)
+		}
+		require.True(t, m.Cap <= m.Max)
+		require.Equal(t, MemoryPagesToBytesNum(m.Cap), uint64(cap(m.Buffer)))
+	}
+	_, ok := m.Grow(1)
+	require.False(t, ok)
 }
