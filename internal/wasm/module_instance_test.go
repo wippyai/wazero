@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
@@ -358,30 +357,64 @@ func TestModuleInstance_CloseModuleOnCanceledOrTimeout(t *testing.T) {
 
 	t.Run("cancel works", func(t *testing.T) {
 		cc := &ModuleInstance{ModuleName: "test", s: s}
-		cancelChan := make(chan struct{})
-		var wg sync.WaitGroup
-		wg.Add(1)
-
-		// Ensure that fn returned by closeModuleOnCanceledOrTimeout exists after cancelFn is called.
-		go func() {
-			defer wg.Done()
-			cc.closeModuleOnCanceledOrTimeout(context.Background(), cancelChan)
-		}()
-		close(cancelChan)
-		wg.Wait()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := cc.CloseModuleOnCanceledOrTimeout(ctx)
+		// The call ends before the context: the module must stay open.
+		done()
+		cancel()
+		time.Sleep(100 * time.Millisecond)
+		require.Nil(t, cc.FailIfClosed())
 	})
 
 	t.Run("no close on all resources canceled", func(t *testing.T) {
 		cc := &ModuleInstance{ModuleName: "test", s: s}
-		cancelChan := make(chan struct{})
-		close(cancelChan)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-
-		cc.closeModuleOnCanceledOrTimeout(ctx, cancelChan)
+		w := &CloseWatch{m: cc, ctx: ctx, finished: true}
+		w.fire()
 
 		err := cc.FailIfClosed()
 		require.Nil(t, err)
+	})
+
+	t.Run("reused watch ignores a late callback", func(t *testing.T) {
+		cc := &ModuleInstance{ModuleName: "test", s: s}
+		var w CloseWatch
+		first, cancelFirst := context.WithCancel(context.Background())
+		w.Start(cc, first).Stop()
+		cancelFirst()
+
+		second, cancelSecond := context.WithCancel(context.Background())
+		defer cancelSecond()
+		active := w.Start(cc, second)
+		// A callback of the first call that runs now sees the second context.
+		w.fire()
+		active.Stop()
+		require.Nil(t, cc.FailIfClosed())
+	})
+
+	t.Run("nested call gets its own watch", func(t *testing.T) {
+		cc := &ModuleInstance{ModuleName: "test", s: s, Sys: internalsys.DefaultContext(nil)}
+		var w CloseWatch
+		outer, cancelOuter := context.WithCancel(context.Background())
+		defer cancelOuter()
+		outerWatch := w.Start(cc, outer)
+		inner, cancelInner := context.WithCancel(context.Background())
+		innerWatch := w.Start(cc, inner)
+		require.True(t, innerWatch != outerWatch)
+		innerWatch.Stop()
+		cancelInner()
+		cancelOuter()
+		time.Sleep(100 * time.Millisecond)
+		outerWatch.Stop()
+		require.EqualError(t, cc.FailIfClosed(), "module closed with context canceled")
+	})
+
+	t.Run("background context", func(t *testing.T) {
+		cc := &ModuleInstance{ModuleName: "test", s: s}
+		done := cc.CloseModuleOnCanceledOrTimeout(context.Background())
+		done()
+		require.Nil(t, cc.FailIfClosed())
 	})
 }
 
@@ -480,4 +513,19 @@ func TestModuleInstance_ensureResourcesClosed(t *testing.T) {
 		require.False(t, buf.freed)
 		require.NotNil(t, mem.expBuffer)
 	})
+}
+
+func TestCloseWatchNestedBackgroundDoesNotStopOuter(t *testing.T) {
+	module := &ModuleInstance{ModuleName: "nested", s: newStore()}
+	var watch CloseWatch
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	outer := watch.Start(module, ctx)
+	inner := watch.Start(module, context.Background())
+	inner.Stop()
+	cancel()
+	// Run the callback deterministically instead of depending on scheduling.
+	watch.fire()
+	outer.Stop()
+	require.True(t, module.IsClosed(), "nested background call stopped the outer cancellation watch")
 }

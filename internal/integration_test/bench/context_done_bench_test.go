@@ -43,36 +43,47 @@ func BenchmarkContextDoneOverhead(b *testing.B) {
 		if ensure {
 			label = "with"
 		}
-		b.Run(label+"_close_on_ctx_done", func(b *testing.B) {
-			ctx := context.Background()
-			cfg := wazero.NewRuntimeConfigCompiler().WithCloseOnContextDone(ensure)
-			r := wazero.NewRuntimeWithConfig(ctx, cfg)
-			defer r.Close(ctx)
-
-			mod, err := r.Instantiate(ctx, bin)
-			require.NoError(b, err)
-
-			tightLoop := mod.ExportedFunction("tight_loop")
-			memLoop := mod.ExportedFunction("mem_loop")
-
-			for _, sz := range itersByName {
-				sz := sz
-				b.Run("tight/"+sz.name, func(b *testing.B) {
-					for i := 0; i < b.N; i++ {
-						if _, err := tightLoop.Call(ctx, sz.iters); err != nil {
-							b.Fatal(err)
-						}
-					}
-				})
-				b.Run("mem/"+sz.name, func(b *testing.B) {
-					for i := 0; i < b.N; i++ {
-						if _, err := memLoop.Call(ctx, sz.iters); err != nil {
-							b.Fatal(err)
-						}
-					}
-				})
+		for _, cancelable := range []bool{false, true} {
+			name := label + "_close_on_ctx_done"
+			if cancelable {
+				name += "/cancelable_ctx"
 			}
-		})
+			b.Run(name, func(b *testing.B) {
+				ctx := context.Background()
+				if cancelable {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithCancel(ctx)
+					defer cancel()
+				}
+				cfg := wazero.NewRuntimeConfigCompiler().WithCloseOnContextDone(ensure)
+				r := wazero.NewRuntimeWithConfig(ctx, cfg)
+				defer r.Close(ctx)
+
+				mod, err := r.Instantiate(ctx, bin)
+				require.NoError(b, err)
+
+				tightLoop := mod.ExportedFunction("tight_loop")
+				memLoop := mod.ExportedFunction("mem_loop")
+
+				for _, sz := range itersByName {
+					sz := sz
+					b.Run("tight/"+sz.name, func(b *testing.B) {
+						for i := 0; i < b.N; i++ {
+							if _, err := tightLoop.Call(ctx, sz.iters); err != nil {
+								b.Fatal(err)
+							}
+						}
+					})
+					b.Run("mem/"+sz.name, func(b *testing.B) {
+						for i := 0; i < b.N; i++ {
+							if _, err := memLoop.Call(ctx, sz.iters); err != nil {
+								b.Fatal(err)
+							}
+						}
+					})
+				}
+			})
+		}
 	}
 }
 

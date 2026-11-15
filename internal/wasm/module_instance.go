@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/sys"
@@ -25,44 +26,87 @@ func (m *ModuleInstance) FailIfClosed() (err error) {
 }
 
 // CloseModuleOnCanceledOrTimeout take a context `ctx`, which might be a Cancel or Timeout context,
-// and spawns the Goroutine to check the context is canceled ot deadline exceeded. If it reaches
-// one of the conditions, it sets the appropriate exit code.
+// and closes the module with the appropriate exit code when the context is canceled or its deadline
+// is exceeded before the returned context.CancelFunc is called.
 //
-// Callers of this function must invoke the returned context.CancelFunc to release the spawned Goroutine.
+// Callers of this function must invoke the returned context.CancelFunc when the call ends.
+// Engines that call repeatedly should reuse a CloseWatch instead.
 func (m *ModuleInstance) CloseModuleOnCanceledOrTimeout(ctx context.Context) context.CancelFunc {
-	// Creating an empty channel in this case is a bit more efficient than
-	// creating a context.Context and canceling it with the same effect. We
-	// really just need to be notified when to stop listening to the users
-	// context. Closing the channel will unblock the select in the goroutine
-	// causing it to return an stop listening to ctx.Done().
-	cancelChan := make(chan struct{})
-	go m.closeModuleOnCanceledOrTimeout(ctx, cancelChan)
-	return func() { close(cancelChan) }
+	if ctx.Done() == nil {
+		// The context can never be canceled.
+		return noopCancel
+	}
+	return (&CloseWatch{}).Start(m, ctx).Stop
 }
 
-// closeModuleOnCanceledOrTimeout is extracted from CloseModuleOnCanceledOrTimeout for testing.
-func (m *ModuleInstance) closeModuleOnCanceledOrTimeout(ctx context.Context, cancelChan <-chan struct{}) {
-	select {
-	case <-ctx.Done():
-		select {
-		case <-cancelChan:
-			// In some cases by the time this goroutine is scheduled, the caller
-			// has already closed both the context and the cancelChan. In this
-			// case go will randomize which branch of the outer select to enter
-			// and we don't want to close the module.
-		default:
-			// This is the same logic as CloseWithCtxErr except this calls closeWithExitCodeWithoutClosingResource
-			// so that we can defer the resource closure in FailIfClosed.
-			switch {
-			case errors.Is(ctx.Err(), context.Canceled):
-				// TODO: figure out how to report error here.
-				_ = m.closeWithExitCodeWithoutClosingResource(sys.ExitCodeContextCanceled)
-			case errors.Is(ctx.Err(), context.DeadlineExceeded):
-				// TODO: figure out how to report error here.
-				_ = m.closeWithExitCodeWithoutClosingResource(sys.ExitCodeDeadlineExceeded)
-			}
-		}
-	case <-cancelChan:
+func noopCancel() {}
+
+// CloseWatch closes a module when the context of a call ends before the call
+// does. One CloseWatch serves the sequential calls of one call engine; it uses
+// context.AfterFunc instead of a goroutine per call that waits on ctx.Done().
+type CloseWatch struct {
+	mu       sync.Mutex
+	m        *ModuleInstance
+	ctx      context.Context
+	stop     func() bool
+	fireFunc func()
+	finished bool
+}
+
+// Start watches ctx for one call of m and returns the watch to Stop when the
+// call ends. A nested call while w is active gets a new watch.
+func (w *CloseWatch) Start(m *ModuleInstance, ctx context.Context) *CloseWatch {
+	if w.stop != nil {
+		return (&CloseWatch{}).Start(m, ctx)
+	}
+	if ctx.Done() == nil {
+		// A nested non-cancelable call must not stop its outer call's watch.
+		return w
+	}
+	if w.fireFunc == nil {
+		w.fireFunc = w.fire
+	}
+	w.mu.Lock()
+	w.m, w.ctx, w.finished = m, ctx, false
+	w.mu.Unlock()
+	w.stop = context.AfterFunc(ctx, w.fireFunc)
+	return w
+}
+
+// Stop ends the watch that Start began.
+func (w *CloseWatch) Stop() {
+	if w.stop == nil {
+		return
+	}
+	w.mu.Lock()
+	w.finished = true
+	w.m, w.ctx = nil, nil
+	w.mu.Unlock()
+	w.stop()
+	w.stop = nil
+}
+
+// fire runs when a watched context ends. A callback from an earlier call can run
+// after a later Start; it then sees the context of the later call, which closes
+// the module only if that context ended too.
+func (w *CloseWatch) fire() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.finished {
+		return
+	}
+	// Serialize closing with Stop and the next Start. An expired callback
+	// must not close an instance after a later call has begun.
+	m, err := w.m, w.ctx.Err()
+	// This is the same logic as CloseWithCtxErr except this calls closeWithExitCodeWithoutClosingResource
+	// so that we can defer the resource closure in FailIfClosed.
+	switch {
+	case errors.Is(err, context.Canceled):
+		// TODO: figure out how to report error here.
+		_ = m.closeWithExitCodeWithoutClosingResource(sys.ExitCodeContextCanceled)
+	case errors.Is(err, context.DeadlineExceeded):
+		// TODO: figure out how to report error here.
+		_ = m.closeWithExitCodeWithoutClosingResource(sys.ExitCodeDeadlineExceeded)
 	}
 }
 

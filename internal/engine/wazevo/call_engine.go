@@ -32,6 +32,8 @@ type (
 		preambleExecutable *byte
 		// parent is the *moduleEngine from which this callEngine is created.
 		parent *moduleEngine
+		// closeWatch serves ensureTermination for the sequential calls of this engine.
+		closeWatch wasm.CloseWatch
 		// indexInModule is the index of the function in the module.
 		indexInModule wasm.Index
 		// sizeOfParamResultSlice is the size of the parameter/result slice.
@@ -346,8 +348,7 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 	}()
 
 	if ensureTermination {
-		done := m.CloseModuleOnCanceledOrTimeout(ctx)
-		defer done()
+		defer c.closeWatch.Start(m, ctx).Stop()
 	}
 
 	if c.stackTop&(16-1) != 0 {
