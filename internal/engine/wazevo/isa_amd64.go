@@ -3,6 +3,8 @@
 package wazevo
 
 import (
+	"encoding/binary"
+
 	"github.com/tetratelabs/wazero/internal/engine/wazevo/backend"
 	"github.com/tetratelabs/wazero/internal/engine/wazevo/backend/isa/amd64"
 )
@@ -27,4 +29,17 @@ func goCallStackView(stackPointerBeforeGoCall *uint64) []uint64 {
 // More precisely, absolute addresses (frame pointers) in the stack must be adjusted.
 func adjustClonedStack(oldsp, oldTop, sp, fp, top uintptr) {
 	amd64.AdjustClonedStack(oldsp, oldTop, sp, fp, top)
+}
+
+// goCallFrameSize returns the size of the Go function trampoline frame at sp:
+// the region from sp up to and including the caller's RBP and the return address.
+func goCallFrameSize(_ []byte, sp, fp uintptr) uintptr {
+	return fp + 16 - sp
+}
+
+// adjustRestoredGoCallFrame fixes the absolute caller RBP saved in a trampoline
+// frame that is restored onto a stack whose top moved by delta.
+func adjustRestoredGoCallFrame(frame []byte, fpOffset, delta uintptr) {
+	callerRBP := binary.LittleEndian.Uint64(frame[fpOffset:])
+	binary.LittleEndian.PutUint64(frame[fpOffset:], callerRBP+uint64(delta))
 }

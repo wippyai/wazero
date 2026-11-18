@@ -3,6 +3,8 @@
 package wazevo
 
 import (
+	"encoding/binary"
+
 	"github.com/tetratelabs/wazero/internal/engine/wazevo/backend"
 	"github.com/tetratelabs/wazero/internal/engine/wazevo/backend/isa/arm64"
 )
@@ -30,3 +32,15 @@ func adjustClonedStack(oldsp, oldTop, sp, fp, top uintptr) {
 	//  so no need to adjustment on arm64. However, when we make it absolute, which in my opinion is better perf-wise
 	//  at the expense of slightly costly stack growth, we need to adjust the pushed frame pointers.
 }
+
+// goCallFrameSize returns the size of the Go function trampoline frame at sp:
+// (frame_size, sliceSize), the Go call slice, (return address, size_of_arg_ret)
+// and the arg/ret slot.
+func goCallFrameSize(frame []byte, _, _ uintptr) uintptr {
+	frameSize := uintptr(binary.LittleEndian.Uint64(frame))
+	argRetSize := uintptr(binary.LittleEndian.Uint64(frame[16+frameSize+8:]))
+	return 16 + frameSize + 16 + argRetSize
+}
+
+// adjustRestoredGoCallFrame is a no-op: the arm64 frames hold no absolute stack addresses.
+func adjustRestoredGoCallFrame([]byte, uintptr, uintptr) {}

@@ -27,3 +27,11 @@ func goCallStackView(stackPointerBeforeGoCall *uint64) []uint64 {
 func adjustClonedStack(oldsp, oldTop, sp, fp, top uintptr) {
 	panic("unsupported architecture")
 }
+
+func goCallFrameSize([]byte, uintptr, uintptr) uintptr {
+	panic("unsupported architecture")
+}
+
+func adjustRestoredGoCallFrame([]byte, uintptr, uintptr) {
+	panic("unsupported architecture")
+}
