@@ -143,11 +143,26 @@ func NewEngine(ctx context.Context, _ api.CoreFeatures, fc filecache.Cache) wasm
 }
 
 // CompileModule implements wasm.Engine.
+// releaseFunctionBodies drops the function bodies of a compiled module. They are
+// only read by validation and compilation, and they can be as large as the
+// module binary.
+func releaseFunctionBodies(module *wasm.Module) {
+	for i := range module.CodeSection {
+		module.CodeSection[i].Body = nil
+	}
+}
+
 func (e *engine) CompileModule(ctx context.Context, module *wasm.Module, listeners []experimental.FunctionListener, ensureTermination bool) (err error) {
 	if wazevoapi.PerfMapEnabled {
 		wazevoapi.PerfMap.Lock()
 		defer wazevoapi.PerfMap.Unlock()
 	}
+
+	defer func() {
+		if err == nil {
+			releaseFunctionBodies(module)
+		}
+	}()
 
 	if _, ok, err := e.getCompiledModule(module, listeners, ensureTermination); ok { // cache hit!
 		return nil

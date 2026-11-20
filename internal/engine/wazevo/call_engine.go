@@ -60,21 +60,29 @@ type (
 	}
 
 	// tryHandler records the state at a try_table entry for exception handling.
-	// On match, we restore the stack to the checkpoint state and re-enter at returnAddress.
+	// On match, we unwind to the try_table frame and re-enter at returnAddress.
+	//
+	// The frames at and above the try_table function stay untouched on the live
+	// stack while the handler is active, so only the try_table enter trampoline
+	// frame (below the try_table function's stack pointer) is saved. Positions are
+	// kept relative to the stack top, because the stack can grow and move.
 	tryHandler struct {
-		// Cloned stack and state from the try_table entry checkpoint,
-		// using the same approach as experimental.Snapshot.
-		sp, fp, top    uintptr
+		relSP, relFP   uintptr
+		top            uintptr
 		returnAddress  *byte
 		savedRegisters [64][2]uint64
-		stack          []byte // cloned stack
+		// frame holds the bytes of the enter trampoline frame, [sp, sp+frameLen).
+		frame    [goCallFrameMaxSize]byte
+		frameLen uintptr
 		// catchClauses describes what exceptions this handler catches.
 		catchClauses []wazevoapi.CatchClauseInstance
 		// localsSaveArea is a heap buffer where locals are mirrored inside
 		// try bodies. Handlers read from it to get updated values.
-		// Nil for nested same-function try_tables that reuse the enclosing
+		// The buffer is kept for reuse after the handler is popped; ownsSaveArea
+		// is false for nested same-function try_tables that reuse the enclosing
 		// handler's save area.
 		localsSaveArea []uint64
+		ownsSaveArea   bool
 		// moduleInstance is the module that set up this try handler.
 		// Used for tag matching in doHandleException (the tag index in
 		// catch clauses is relative to this module's tag index space).
@@ -619,8 +627,6 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 		case wazevoapi.ExitCodeNullReference:
 			panic(wasmruntime.ErrRuntimeNullReference)
 		case wazevoapi.ExitCodeTryTableEnter:
-			// Save current state as a try handler checkpoint using stack cloning
-			// (same approach as experimental.Snapshot).
 			// The encoded exit code (with tryTableID in upper bits) is on the
 			// Go call stack as the second trampoline argument, not in execCtx.exitCode.
 			tryTableEnterStack := goCallStackView(c.execCtx.stackPointerBeforeGoCall)
@@ -628,30 +634,32 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			mod := c.callerModuleInstance()
 			me := mod.Engine.(*moduleEngine)
 			info := &me.parent.tryTableInfo[tryTableID]
-			returnAddress := c.execCtx.goCallReturnAddress
-			oldTop, oldSp := c.stackTop, uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall))
-			newSP, newFP, newTop, newStack := c.cloneStack(uintptr(len(c.stack)) + 16)
-			adjustClonedStack(oldSp, oldTop, newSP, newFP, newTop)
 
-			// Allocate a heap buffer for locals so handlers can read throw-time values.
+			n := len(c.tryHandlers)
+			if n < cap(c.tryHandlers) {
+				c.tryHandlers = c.tryHandlers[:n+1]
+			} else {
+				c.tryHandlers = append(c.tryHandlers, tryHandler{})
+			}
+			h := &c.tryHandlers[n]
+			c.saveTryHandlerFrame(h)
+			h.returnAddress = c.execCtx.goCallReturnAddress
+			h.savedRegisters = c.execCtx.savedRegisters
+			h.catchClauses = info.CatchClauses
+			h.moduleInstance = mod
+
+			// Locals save area so handlers can read throw-time values.
 			// Nested try_tables in the same function (ReuseLocals) share the enclosing handler's save area.
-			var saveArea []uint64
-			if info.NumLocals > 0 && !info.ReuseLocals {
-				saveArea = make([]uint64, info.NumLocals*2) // 16 bytes per local
-				c.execCtx.localsSaveAreaPtr = uintptr(unsafe.Pointer(&saveArea[0]))
+			h.ownsSaveArea = info.NumLocals > 0 && !info.ReuseLocals
+			if h.ownsSaveArea {
+				need := info.NumLocals * 2 // 16 bytes per local
+				if cap(h.localsSaveArea) < need {
+					h.localsSaveArea = make([]uint64, need)
+				}
+				h.localsSaveArea = h.localsSaveArea[:need]
+				c.execCtx.localsSaveAreaPtr = uintptr(unsafe.Pointer(&h.localsSaveArea[0]))
 			}
 
-			c.tryHandlers = append(c.tryHandlers, tryHandler{
-				sp:             newSP,
-				fp:             newFP,
-				top:            newTop,
-				returnAddress:  returnAddress,
-				savedRegisters: c.execCtx.savedRegisters,
-				stack:          newStack,
-				catchClauses:   info.CatchClauses,
-				moduleInstance: mod,
-				localsSaveArea: saveArea,
-			})
 			// Set clauseIdx = -1 (no exception) in execCtx for the compiled code
 			// to read after the trampoline returns.
 			c.execCtx.caughtExceptionClauseIdx = -1
@@ -704,14 +712,12 @@ func (c *callEngine) doHandleException(exn *wasm.Exception) bool {
 				// Store the caught exception so handler code can read params.
 				c.pendingException = exn
 
-				// Restore the cloned stack (like snapshot.doRestore).
-				spp := *(**uint64)(unsafe.Pointer(&h.sp))
-				c.stack = h.stack
-				c.stackTop = h.top
+				// Unwind to the try_table frame on the live stack.
+				sp, fp := c.restoreTryHandlerFrame(h)
+				spp := *(**uint64)(unsafe.Pointer(&sp))
 				ec := &c.execCtx
-				ec.stackBottomPtr = &c.stack[0]
 				ec.stackPointerBeforeGoCall = spp
-				ec.framePointerBeforeGoCall = h.fp
+				ec.framePointerBeforeGoCall = fp
 				ec.goCallReturnAddress = h.returnAddress
 				ec.savedRegisters = h.savedRegisters
 
@@ -729,17 +735,53 @@ func (c *callEngine) doHandleException(exn *wasm.Exception) bool {
 // or clears it if none is found.
 func (c *callEngine) restoreLocalsSaveAreaPtr(from int) {
 	for i := from; i >= 0; i-- {
-		if sa := c.tryHandlers[i].localsSaveArea; len(sa) > 0 {
-			c.execCtx.localsSaveAreaPtr = uintptr(unsafe.Pointer(&sa[0]))
+		if h := &c.tryHandlers[i]; h.ownsSaveArea {
+			c.execCtx.localsSaveAreaPtr = uintptr(unsafe.Pointer(&h.localsSaveArea[0]))
 			return
 		}
 	}
 	c.execCtx.localsSaveAreaPtr = 0
 }
 
+// saveTryHandlerFrame records the stack position of the try_table enter
+// trampoline frame and copies that frame into h.
+func (c *callEngine) saveTryHandlerFrame(h *tryHandler) {
+	sp := uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall))
+	fp := c.execCtx.framePointerBeforeGoCall
+	base := uintptr(unsafe.Pointer(&c.stack[0]))
+	off := sp - base
+	size := goCallFrameSize(c.stack[off:], sp, fp)
+	if size > goCallFrameMaxSize {
+		panic("BUG: try_table enter trampoline frame too large")
+	}
+	copy(h.frame[:size], c.stack[off:off+size])
+	h.frameLen = size
+	h.relSP = c.stackTop - sp
+	h.relFP = c.stackTop - fp
+	h.top = c.stackTop
+}
+
+// restoreTryHandlerFrame writes the saved enter trampoline frame back to the
+// live stack and returns its stack and frame pointers. The stack may have been
+// grown (moved) since the try_table entry.
+func (c *callEngine) restoreTryHandlerFrame(h *tryHandler) (sp, fp uintptr) {
+	sp, fp = c.stackTop-h.relSP, c.stackTop-h.relFP
+	base := uintptr(unsafe.Pointer(&c.stack[0]))
+	off := sp - base
+	dst := c.stack[off : off+h.frameLen]
+	copy(dst, h.frame[:h.frameLen])
+	if c.stackTop != h.top {
+		adjustRestoredGoCallFrame(dst, h.relSP-h.relFP, c.stackTop-h.top)
+	}
+	return
+}
+
 func (c *callEngine) callerModuleInstance() *wasm.ModuleInstance {
 	return moduleInstanceFromOpaquePtr(c.execCtx.callerModuleContextPtr)
 }
+
+// goCallFrameMaxSize is the maximum size of a saved try_table enter trampoline frame.
+const goCallFrameMaxSize = 128
 
 const callStackCeiling = uintptr(50000000) // in uint64 (8 bytes) == 400000000 bytes in total == 400mb.
 
